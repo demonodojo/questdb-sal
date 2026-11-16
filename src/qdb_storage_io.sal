@@ -1,0 +1,42 @@
+import "io/fs.sal"
+import "io/io.sal"
+
+enum FileBytesResult
+    FileBytesOk(Bytes)
+    FileBytesErr(Int)
+
+fn read_fill(fd: Int, bytes: &mut Bytes, offset: Int, length: Int) -> Int ! io
+    position = offset
+    valid = true
+    while position < length && valid
+        count = Fd.new(fd).read(bytes.ptr() + position, length - position)
+        if count <= 0
+            valid = false
+        else
+            position = position + count
+    if valid
+        position
+    else
+        -1
+
+# Read one file into a bounded owned byte buffer. Error codes:
+# -1 stat/open failed, -2 size invalid or above caller's cap, -3 short/read error.
+fn read_file_bytes(path: &String, max_bytes: Int) -> FileBytesResult ! io, alloc
+    file_path = Path.new(path.dup())
+    size = file_path.size()
+    if size < 0
+        FileBytesErr(-1)
+    elsif size > max_bytes || max_bytes < 0
+        FileBytesErr(-2)
+    else
+        fd = file_path.open_read()
+        if fd < 0
+            FileBytesErr(-1)
+        else
+            bytes = Bytes.new(size)
+            read_size = read_fill(fd, &mut bytes, 0, size)
+            _closed = Fd.new(fd).close()
+            if read_size != size
+                FileBytesErr(-3)
+            else
+                FileBytesOk(bytes)

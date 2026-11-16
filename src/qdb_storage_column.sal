@@ -1,0 +1,259 @@
+import "qdb_types.sal"
+import "qdb_storage_meta.sal"
+
+VARCHAR_AUX_WIDTH = 16
+VARCHAR_FLAG_NULL = 4
+VARCHAR_FLAG_INLINED = 1
+VARCHAR_MAX_INLINED = 9
+SYMBOL_HEADER = 64
+
+enum ColumnResult
+    ColumnValues(List[Scalar])
+    ColumnError(Error)
+
+enum SymbolMapResult
+    SymbolValues(List[String])
+    SymbolError(Error)
+
+fn column_error(message: String) -> ColumnResult
+    ColumnError(error_new(message))
+
+fn read_column(meta: &ColumnMeta, rows: Int, data: &Bytes, aux: &Bytes, symbols: &List[String], has_symbols: Bool) -> ColumnResult ! alloc
+    if rows < 0
+        return column_error(meta.name + d": negative row count")
+    if meta.tag == TAG_STRING
+        return read_string_column(meta, rows, data, aux)
+    if meta.tag == TAG_VARCHAR
+        return read_varchar_column(meta, rows, data, aux)
+    if meta.tag == TAG_SYMBOL
+        if !has_symbols
+            return column_error(meta.name + d": missing symbol map")
+        return read_fixed_column(meta, rows, data, symbols, true)
+    read_fixed_column(meta, rows, data, symbols, has_symbols)
+
+fn fixed_width(tag: Int) -> Int
+    if tag == TAG_BOOLEAN || tag == TAG_BYTE
+        1
+    elsif tag == TAG_SHORT || tag == TAG_CHAR
+        2
+    elsif tag == TAG_INT || tag == TAG_SYMBOL || tag == TAG_FLOAT
+        4
+    elsif tag == TAG_LONG || tag == TAG_DATE || tag == TAG_TIMESTAMP || tag == TAG_DOUBLE
+        8
+    else
+        0
+
+fn read_fixed_column(meta: &ColumnMeta, rows: Int, data: &Bytes, symbols: &List[String], has_symbols: Bool) -> ColumnResult ! alloc
+    width = fixed_width(meta.tag)
+    if width == 0
+        return column_error(meta.name + d": unsupported column type " + type_name(meta.tag))
+    if rows > data.len() / width
+        return column_error(meta.name + d": column file is truncated")
+    values = List.new[Scalar]()
+    row = 0
+    while row < rows
+        offset = row * width
+        if meta.tag == TAG_BOOLEAN
+            raw = data.get_u8(offset)
+            if raw == 0
+                values.push(Boolean(false))
+            elsif raw == 1
+                values.push(Boolean(true))
+            else
+                return column_error(meta.name + d": invalid boolean byte at row " + row.to_str())
+        elsif meta.tag == TAG_BYTE
+            raw = data.get_u8(offset)
+            if raw >= 128
+                raw = raw - 256
+            values.push(Byte(raw))
+        elsif meta.tag == TAG_SHORT
+            raw = data.get_u16(offset)
+            if raw >= 32768
+                raw = raw - 65536
+            values.push(Short(raw))
+        elsif meta.tag == TAG_CHAR
+            values.push(Char(data.get_u16(offset)))
+        elsif meta.tag == TAG_INT || meta.tag == TAG_SYMBOL
+            field = read_i32(data, offset)
+            if !field.valid
+                return column_error(meta.name + d": truncated 32-bit value")
+            raw = field.value
+            if raw == INT_NULL
+                values.push(Null)
+            elsif meta.tag == TAG_SYMBOL
+                if raw < 0 || raw >= symbols.len()
+                    return column_error(meta.name + d": invalid symbol key " + raw.to_str())
+                symbol = symbols.get(raw)
+                values.push(Text(symbol.dup()))
+            else
+                values.push(IntValue(raw))
+        elsif meta.tag == TAG_LONG || meta.tag == TAG_DATE || meta.tag == TAG_TIMESTAMP
+            raw = data.get_i64(offset)
+            if raw == LONG_NULL
+                values.push(Null)
+            elsif meta.tag == TAG_LONG
+                values.push(Long(raw))
+            elsif meta.tag == TAG_DATE
+                values.push(Date(raw))
+            else
+                values.push(Timestamp(raw))
+        elsif meta.tag == TAG_FLOAT
+            bits = data.get_u32(offset)
+            if f32_bits_is_nan(bits)
+                values.push(Null)
+            else
+                values.push(Float32(f32_bits_to_float(bits)))
+        elsif meta.tag == TAG_DOUBLE
+            bits = data.get_i64(offset)
+            if f64_bits_is_nan(bits)
+                values.push(Null)
+            else
+                values.push(Double(f64_bits_to_float(bits)))
+        row = row + 1
+    ColumnValues(values)
+
+fn read_string_column(meta: &ColumnMeta, rows: Int, data: &Bytes, aux: &Bytes) -> ColumnResult ! alloc
+    if rows >= aux.len() / 8
+        return column_error(meta.name + d": missing or truncated .i offset file")
+    if aux.get_i64(0) != 0
+        return column_error(meta.name + d": string offsets do not start at zero")
+    values = List.new[Scalar]()
+    row = 0
+    while row < rows
+        start = aux.get_i64(row * 8)
+        end = aux.get_i64((row + 1) * 8)
+        if start < 0 || end < start || end > data.len()
+            return column_error(meta.name + d": string row span is outside the data file")
+        decoded = read_utf16(data, start)
+        if decoded.code == -5
+            if start + decoded.used != end
+                return column_error(meta.name + d": NULL string span has invalid length")
+            values.push(Null)
+        elsif decoded.code != 0
+            return column_error(meta.name + d": invalid or truncated UTF-16 string")
+        elsif start + decoded.used != end
+            return column_error(meta.name + d": string offset does not match stored length")
+        else
+            values.push(Text(decoded.value))
+        row = row + 1
+    ColumnValues(values)
+
+fn is_utf8_continuation(byte: Int) -> Bool
+    byte >= 128 && byte <= 191
+
+fn valid_utf8(bytes: &Bytes, start: Int, length: Int) -> Bool
+    if start < 0 || length < 0 || start > bytes.len() || length > bytes.len() - start
+        return false
+    end = start + length
+    index = start
+    valid = true
+    while index < end && valid
+        first = bytes.get_u8(index)
+        if first <= 127
+            index = index + 1
+        elsif first >= 194 && first <= 223
+            if index + 1 >= end || !is_utf8_continuation(bytes.get_u8(index + 1))
+                valid = false
+            else
+                index = index + 2
+        elsif first == 224
+            if index + 2 >= end
+                valid = false
+            else
+                second = bytes.get_u8(index + 1)
+                third = bytes.get_u8(index + 2)
+                if second < 160 || second > 191 || !is_utf8_continuation(third)
+                    valid = false
+                else
+                    index = index + 3
+        elsif (first >= 225 && first <= 236) || (first >= 238 && first <= 239)
+            if index + 2 >= end || !is_utf8_continuation(bytes.get_u8(index + 1)) || !is_utf8_continuation(bytes.get_u8(index + 2))
+                valid = false
+            else
+                index = index + 3
+        elsif first == 237
+            if index + 2 >= end
+                valid = false
+            else
+                second = bytes.get_u8(index + 1)
+                third = bytes.get_u8(index + 2)
+                if second < 128 || second > 159 || !is_utf8_continuation(third)
+                    valid = false
+                else
+                    index = index + 3
+        elsif first == 240
+            if index + 3 >= end
+                valid = false
+            else
+                second = bytes.get_u8(index + 1)
+                if second < 144 || second > 191 || !is_utf8_continuation(bytes.get_u8(index + 2)) || !is_utf8_continuation(bytes.get_u8(index + 3))
+                    valid = false
+                else
+                    index = index + 4
+        elsif first >= 241 && first <= 243
+            if index + 3 >= end || !is_utf8_continuation(bytes.get_u8(index + 1)) || !is_utf8_continuation(bytes.get_u8(index + 2)) || !is_utf8_continuation(bytes.get_u8(index + 3))
+                valid = false
+            else
+                index = index + 4
+        elsif first == 244
+            if index + 3 >= end
+                valid = false
+            else
+                second = bytes.get_u8(index + 1)
+                if second < 128 || second > 143 || !is_utf8_continuation(bytes.get_u8(index + 2)) || !is_utf8_continuation(bytes.get_u8(index + 3))
+                    valid = false
+                else
+                    index = index + 4
+        else
+            valid = false
+    valid
+
+fn bytes_to_text(bytes: &Bytes, start: Int, length: Int) -> String ! alloc
+    Bytes.view_mem(bytes.ptr() + start, length).to_str()
+
+fn read_varchar_column(meta: &ColumnMeta, rows: Int, data: &Bytes, aux: &Bytes) -> ColumnResult ! alloc
+    if rows > aux.len() / VARCHAR_AUX_WIDTH
+        return column_error(meta.name + d": missing or truncated varchar .i file")
+    values = List.new[Scalar]()
+    row = 0
+    while row < rows
+        offset = row * VARCHAR_AUX_WIDTH
+        header = read_i32(aux, offset)
+        if !header.valid || header.value == 0
+            return column_error(meta.name + d": invalid varchar header at row " + row.to_str())
+        raw = header.value
+        if (raw & VARCHAR_FLAG_NULL) != 0
+            values.push(Null)
+        elsif (raw & VARCHAR_FLAG_INLINED) != 0
+            size = (raw >> 4) & 15
+            start = offset + 1
+            if size > VARCHAR_MAX_INLINED || !valid_utf8(aux, start, size)
+                return column_error(meta.name + d": invalid inlined UTF-8 at row " + row.to_str())
+            values.push(Text(bytes_to_text(aux, start, size)))
+        else
+            size = (raw >> 4) & 268435455
+            word = aux.get_i64(offset + 8)
+            start = word >> 16
+            if start < 0 || !valid_utf8(data, start, size)
+                return column_error(meta.name + d": invalid external UTF-8 span at row " + row.to_str())
+            values.push(Text(bytes_to_text(data, start, size)))
+        row = row + 1
+    ColumnValues(values)
+
+fn read_symbol_map(chars: &Bytes, offsets: &Bytes, count: Int, name: &String) -> SymbolMapResult ! alloc
+    if count < 0 || offsets.len() < SYMBOL_HEADER || count > (offsets.len() - SYMBOL_HEADER) / 8
+        return SymbolError(error_new(name.dup() + d": invalid symbol map size"))
+    values = List.new[String]()
+    key = 0
+    while key < count
+        start = offsets.get_i64(SYMBOL_HEADER + key * 8)
+        if start < 0
+            return SymbolError(error_new(name.dup() + d": negative symbol offset"))
+        decoded = read_utf16(chars, start)
+        if decoded.code == -5
+            return SymbolError(error_new(name.dup() + d": symbol key refers to NULL"))
+        if decoded.code != 0
+            return SymbolError(error_new(name.dup() + d": invalid symbol UTF-16"))
+        values.push(decoded.value)
+        key = key + 1
+    SymbolValues(values)

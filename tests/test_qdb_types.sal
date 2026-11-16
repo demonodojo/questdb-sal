@@ -1,0 +1,68 @@
+import "../src/qdb_types.sal"
+import "support/assert.sal"
+
+fn assert_timestamp_invalid(text: &String) -> Int ! alloc
+    match parse_timestamp_micros(text)
+        Present(_) => 0
+        Missing => 1
+
+fn main() -> Int ! io, alloc
+    deleted = assert_zero(type_tag(-1) + 1, 1)
+    if deleted != 0
+        deleted
+    else
+        timestamp = assert_zero(type_tag(TAG_TIMESTAMP | (1 << 17)) - TAG_TIMESTAMP, 2)
+        if timestamp != 0
+            timestamp
+        else
+            ipv4 = type_name(type_tag(TAG_IPV4))
+            name_check = assert_str_eq(&ipv4, &d"IPv4", 3)
+            if name_check != 0
+                name_check
+            else
+                unsupported = type_name(255)
+                name_check = assert_str_eq(&unsupported, &d"UNSUPPORTED", 4)
+                if name_check != 0
+                    name_check
+                elsif scalar_is_null(&Null)
+                    5
+                elsif scalar_is_null(&IntValue(INT_NULL))
+                    6
+                else
+                    epoch = civil_from_unix_days(0)
+                    epoch_check = assert_zero(epoch.year - 1970, 7)
+                    if epoch_check != 0
+                        epoch_check
+                    elsif epoch.month != 1
+                        8
+                    elsif epoch.day != 1
+                        9
+                    else
+                        days_check = assert_zero(unix_days_from_civil(1969, 12, 31) + 1, 10)
+                        if days_check != 0
+                            days_check
+                        else
+                            formatted = format_timestamp_micros(1577934245000000)
+                            format_check = assert_str_eq(&formatted, &d"2020-01-02T03:04:05.000000Z", 11)
+                            if format_check != 0
+                                format_check
+                            else
+                                parsed = parse_timestamp_micros(&d"2020-01-02T03:04:05.123456789Z")
+                                match parsed
+                                    Present(value) =>
+                                        value_check = assert_zero(value - 1577934245123456, 12)
+                                        if value_check != 0
+                                            value_check
+                                        else
+                                            date_value = parse_date_millis(&d"2020-01-02T00:00:00.123456789Z")
+                                            match date_value
+                                                Present(ms) =>
+                                                    date_check = assert_zero(ms - 1577923200123, 13)
+                                                    if date_check != 0
+                                                        date_check
+                                                    else
+                                                        invalid_fraction = assert_timestamp_invalid(&d"2020-01-02T03:04:05.1234567890Z")
+                                                        invalid_day = assert_timestamp_invalid(&d"2020-01-32T03:04:05Z")
+                                                        assert_zero(invalid_fraction + invalid_day, 14)
+                                                Missing => 14
+                                    Missing => 15

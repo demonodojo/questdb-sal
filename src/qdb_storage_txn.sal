@@ -1,0 +1,141 @@
+import "qdb_types.sal"
+import "qdb_storage_meta.sal"
+
+TX_BASE_OFFSET_VERSION = 0
+TX_BASE_OFFSET_A = 8
+TX_BASE_OFFSET_SYMBOLS_SIZE_A = 12
+TX_BASE_OFFSET_PARTITIONS_SIZE_A = 16
+TX_BASE_OFFSET_B = 32
+TX_BASE_OFFSET_SYMBOLS_SIZE_B = 36
+TX_BASE_OFFSET_PARTITIONS_SIZE_B = 40
+TX_OFFSET_TXN = 0
+TX_OFFSET_TRANSIENT_ROW_COUNT = 8
+TX_OFFSET_FIXED_ROW_COUNT = 16
+TX_OFFSET_MIN_TIMESTAMP = 24
+TX_OFFSET_MAX_TIMESTAMP = 32
+TX_OFFSET_MAP_WRITER_COUNT = 128
+SYMBOL_WRITER_SLOT = 8
+PARTITION_RECORD_BYTES = 32
+PARTITION_SIZE_MASK = 17592186044415
+PARTITION_PARQUET_FORMAT_BIT = 2305843009213693952
+PARTITION_COMPOSITE_BIT = 2305843009213693952
+
+struct PartitionRecord
+    timestamp: Int
+    stored_row_count: Int
+    name_txn: Int
+
+struct TxnHeader
+    txn: Int
+    transient_row_count: Int
+    fixed_row_count: Int
+    min_timestamp: Int
+    max_timestamp: Int
+    symbol_counts: List[Int]
+    partitions: List[PartitionRecord]
+
+enum TxnResult
+    TxnOk(TxnHeader)
+    TxnErr(Error)
+
+fn read_i64(bytes: &Bytes, offset: Int) -> ReadInt
+    if offset < 0 || offset > bytes.len() - 8
+        ReadInt(0, false)
+    else
+        ReadInt(bytes.get_i64(offset), true)
+
+fn txn_error(message: String) -> TxnResult
+    TxnErr(error_new(message))
+
+fn parse_txn(bytes: &Bytes) -> TxnResult ! alloc
+    version_field = read_i64(bytes, TX_BASE_OFFSET_VERSION)
+    if !version_field.valid
+        return txn_error(d"_txn: truncated version")
+    version = version_field.value
+    base = 0
+    symbols_size = 0
+    partitions_size = 0
+    base_field = ReadInt(0, false)
+    symbols_field = ReadInt(0, false)
+    partitions_field = ReadInt(0, false)
+    if (version & 1) == 0
+        base_field = read_i32(bytes, TX_BASE_OFFSET_A)
+        symbols_field = read_i32(bytes, TX_BASE_OFFSET_SYMBOLS_SIZE_A)
+        partitions_field = read_i32(bytes, TX_BASE_OFFSET_PARTITIONS_SIZE_A)
+    else
+        base_field = read_i32(bytes, TX_BASE_OFFSET_B)
+        symbols_field = read_i32(bytes, TX_BASE_OFFSET_SYMBOLS_SIZE_B)
+        partitions_field = read_i32(bytes, TX_BASE_OFFSET_PARTITIONS_SIZE_B)
+    if !base_field.valid || !symbols_field.valid || !partitions_field.valid
+        return txn_error(d"_txn: truncated section header")
+    base = base_field.value
+    symbols_size = symbols_field.value
+    partitions_size = partitions_field.value
+    if base < 0 || symbols_size < 0 || symbols_size % SYMBOL_WRITER_SLOT != 0 || partitions_size < 0 || partitions_size % PARTITION_RECORD_BYTES != 0
+        return txn_error(d"_txn: invalid section bounds")
+
+    section_txn = read_i64(bytes, base + TX_OFFSET_TXN)
+    transient_field = read_i64(bytes, base + TX_OFFSET_TRANSIENT_ROW_COUNT)
+    fixed_field = read_i64(bytes, base + TX_OFFSET_FIXED_ROW_COUNT)
+    min_field = read_i64(bytes, base + TX_OFFSET_MIN_TIMESTAMP)
+    max_field = read_i64(bytes, base + TX_OFFSET_MAX_TIMESTAMP)
+    map_count_field = read_i32(bytes, base + TX_OFFSET_MAP_WRITER_COUNT)
+    if !section_txn.valid || !transient_field.valid || !fixed_field.valid || !min_field.valid || !max_field.valid || !map_count_field.valid
+        return txn_error(d"_txn: selected section extends past the file")
+    if section_txn.value != version
+        return txn_error(d"_txn: selected section transaction does not match version")
+    transient = transient_field.value
+    fixed = fixed_field.value
+    if transient < 0 || fixed < 0
+        return txn_error(d"_txn: negative row count")
+    if fixed > 9223372036854775807 - transient
+        return txn_error(d"_txn: row count overflow")
+
+    symbol_columns = symbols_size / SYMBOL_WRITER_SLOT
+    if map_count_field.value < 0 || map_count_field.value != symbol_columns
+        return txn_error(d"_txn: symbol column count does not match section size")
+    symbol_counts = List.new[Int]()
+    symbol_index = 0
+    while symbol_index < symbol_columns
+        count_field = read_i32(bytes, base + TX_OFFSET_MAP_WRITER_COUNT + 4 + symbol_index * SYMBOL_WRITER_SLOT)
+        if !count_field.valid || count_field.value < 0
+            return txn_error(d"_txn: invalid symbol value count")
+        symbol_counts.push(count_field.value)
+        symbol_index = symbol_index + 1
+
+    size_offset = base + TX_OFFSET_MAP_WRITER_COUNT + 4 + symbols_size
+    recorded_size = read_i32(bytes, size_offset)
+    if !recorded_size.valid || recorded_size.value != partitions_size
+        return txn_error(d"_txn: partition table size does not match section header")
+    partition_count = partitions_size / PARTITION_RECORD_BYTES
+    partitions = List.new[PartitionRecord]()
+    previous_timestamp = LONG_NULL
+    partition_index = 0
+    while partition_index < partition_count
+        offset = size_offset + 4 + partition_index * PARTITION_RECORD_BYTES
+        timestamp_field = read_i64(bytes, offset)
+        size_field = read_i64(bytes, offset + 8)
+        name_txn_field = read_i64(bytes, offset + 16)
+        format_field = read_i64(bytes, offset + 24)
+        if !timestamp_field.valid || !size_field.valid || !name_txn_field.valid || !format_field.valid
+            return txn_error(d"_txn: partition record extends past file")
+        timestamp = timestamp_field.value
+        if partition_index > 0 && timestamp <= previous_timestamp
+            return txn_error(d"_txn: partition timestamps are not increasing")
+        previous_timestamp = timestamp
+        if (size_field.value & PARTITION_PARQUET_FORMAT_BIT) != 0
+            return txn_error(d"_txn: parquet partitions are unsupported")
+        if (format_field.value & PARTITION_COMPOSITE_BIT) != 0
+            return txn_error(d"_txn: composite partitions are unsupported")
+        name_txn = name_txn_field.value
+        if name_txn < -1
+            return txn_error(d"_txn: invalid partition name transaction")
+        partitions.push(PartitionRecord(timestamp, size_field.value & PARTITION_SIZE_MASK, name_txn))
+        partition_index = partition_index + 1
+    TxnOk(TxnHeader(version, transient, fixed, min_field.value, max_field.value, symbol_counts, partitions))
+
+fn txn_row_count(txn: &TxnHeader) -> Int
+    if txn.transient_row_count < 0 || txn.fixed_row_count < 0 || txn.fixed_row_count > 9223372036854775807 - txn.transient_row_count
+        -1
+    else
+        txn.fixed_row_count + txn.transient_row_count

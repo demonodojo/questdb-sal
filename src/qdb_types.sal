@@ -1,0 +1,311 @@
+# Numeric column type tags from QuestDB OSS 10.1.0 (ColumnType).
+# Keep these values aligned with crates/qdb-types/src/lib.rs in questdb-rust.
+
+METADATA_VERSION_10_1_0 = 426
+PARTITION_BY_DAY = 0
+PARTITION_BY_NONE = 3
+NULL_STRING_LEN = -1
+INT_NULL = -2147483648
+LONG_NULL = -9223372036854775807 - 1
+
+TAG_BOOLEAN = 1
+TAG_BYTE = 2
+TAG_SHORT = 3
+TAG_CHAR = 4
+TAG_INT = 5
+TAG_LONG = 6
+TAG_DATE = 7
+TAG_TIMESTAMP = 8
+TAG_FLOAT = 9
+TAG_DOUBLE = 10
+TAG_STRING = 11
+TAG_SYMBOL = 12
+TAG_IPV4 = 25
+TAG_VARCHAR = 26
+TIMESTAMP_NANO_FLAG = 262144
+
+enum Scalar
+    Null
+    Boolean(Bool)
+    Byte(Int)
+    Short(Int)
+    Char(Int)
+    IntValue(Int)
+    Long(Int)
+    Float32(Float)
+    Double(Float)
+    Date(Int)
+    Timestamp(Int)
+    Text(String)
+
+enum OptionalInt
+    Missing
+    Present(Int)
+
+struct CivilDate
+    year: Int
+    month: Int
+    day: Int
+
+struct TimeParts
+    date: String
+    fraction: Int
+
+struct ParsedNumber
+    value: Int
+    valid: Bool
+
+struct Error
+    message: String
+    has_position: Bool
+    position: Int
+
+fn pad_decimal(value: Int, width: Int) -> String ! alloc
+    text = value.to_str()
+    while text.len() < width
+        text = "0" + text
+    text
+
+fn format_year(year: Int) -> String ! alloc
+    if year < 0
+        "-" + pad_decimal(-year, 3)
+    else
+        pad_decimal(year, 4)
+
+fn floor_div(value: Int, divisor: Int) -> Int
+    quotient = value / divisor
+    remainder = value % divisor
+    if remainder < 0
+        quotient - 1
+    else
+        quotient
+
+fn civil_from_unix_days(days: Int) -> CivilDate
+    z = days + 719468
+    era = floor_div(z, 146097)
+    day_of_era = z - era * 146097
+    year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365
+    year = year_of_era + era * 400
+    day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100)
+    month_prime = (5 * day_of_year + 2) / 153
+    day = day_of_year - (153 * month_prime + 2) / 5 + 1
+    month = month_prime + 3
+    if month_prime >= 10
+        month = month_prime - 9
+    if month <= 2
+        year = year + 1
+    CivilDate(year, month, day)
+
+fn unix_days_from_civil(year: Int, month: Int, day: Int) -> Int
+    adjusted_year = year
+    if month <= 2
+        adjusted_year = year - 1
+    era = floor_div(adjusted_year, 400)
+    year_of_era = adjusted_year - era * 400
+    month_prime = month + 9
+    if month > 2
+        month_prime = month - 3
+    day_of_year = (153 * month_prime + 2) / 5 + day - 1
+    day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+    era * 146097 + day_of_era - 719468
+
+fn split_subseconds(value: Int, scale: Int) -> TimeParts ! alloc
+    seconds = floor_div(value, scale)
+    fraction = value - seconds * scale
+    days = floor_div(seconds, 86400)
+    second_of_day = seconds - days * 86400
+    civil = civil_from_unix_days(days)
+    hour = second_of_day / 3600
+    minute = second_of_day % 3600 / 60
+    second = second_of_day % 60
+    date = format_year(civil.year) + "-" + pad_decimal(civil.month, 2) + "-" + pad_decimal(civil.day, 2)
+    date = date + "T" + pad_decimal(hour, 2) + ":" + pad_decimal(minute, 2) + ":" + pad_decimal(second, 2)
+    TimeParts(date, fraction)
+
+fn format_date_millis(value: Int) -> String ! alloc
+    parts = split_subseconds(value, 1000)
+    parts.date + "." + pad_decimal(parts.fraction, 3) + "Z"
+
+fn format_timestamp_micros(value: Int) -> String ! alloc
+    parts = split_subseconds(value, 1000000)
+    parts.date + "." + pad_decimal(parts.fraction, 6) + "Z"
+
+fn parse_digits(text: &String, start: Int, end: Int) -> ParsedNumber
+    if start < 0 || end > text.len() || start >= end
+        return ParsedNumber(0, false)
+    value = 0
+    i = start
+    while i < end
+        digit = text.char(i) - 48
+        if digit < 0 || digit > 9
+            return ParsedNumber(0, false)
+        if value > 214748364
+            return ParsedNumber(0, false)
+        value = value * 10 + digit
+        if value > 2147483648
+            return ParsedNumber(0, false)
+        i = i + 1
+    ParsedNumber(value, true)
+
+fn parse_utc_scaled(text: &String, scale: Int) -> OptionalInt ! alloc
+    n = text.len()
+    if (scale != 1000 && scale != 1000000) || n < 1
+        return Missing
+    if text.char(n - 1) != 90
+        return Missing
+    t_pos = text.index_of(d"T")
+    if t_pos < 0 || t_pos >= n - 1
+        return Missing
+
+    year_start = 0
+    if text.char(0) == 45
+        return Missing
+    if text.char(0) == 43
+        year_start = 1
+    dash1 = text.index_from(d"-", year_start)
+    if dash1 <= year_start || dash1 >= t_pos
+        return Missing
+    dash2 = text.index_from(d"-", dash1 + 1)
+    if dash2 <= dash1 + 1 || dash2 >= t_pos
+        return Missing
+    year_part = parse_digits(text, year_start, dash1)
+    month_part = parse_digits(text, dash1 + 1, dash2)
+    day_part = parse_digits(text, dash2 + 1, t_pos)
+    if !year_part.valid || !month_part.valid || !day_part.valid
+        return Missing
+    if year_part.value > 2147483647
+        return Missing
+    year = year_part.value
+    month = month_part.value
+    day = day_part.value
+    if month < 1 || month > 12 || day < 1 || day > 31
+        return Missing
+
+    colon1 = text.index_from(d":", t_pos + 1)
+    colon2 = text.index_from(d":", colon1 + 1)
+    z_pos = n - 1
+    if colon1 <= t_pos + 1 || colon2 <= colon1 + 1 || colon2 >= z_pos
+        return Missing
+    dot = text.index_from(d".", colon2 + 1)
+    seconds_end = z_pos
+    if dot >= 0
+        if dot <= colon2 + 1 || dot >= z_pos
+            return Missing
+        seconds_end = dot
+    hour_part = parse_digits(text, t_pos + 1, colon1)
+    minute_part = parse_digits(text, colon1 + 1, colon2)
+    second_part = parse_digits(text, colon2 + 1, seconds_end)
+    if !hour_part.valid || !minute_part.valid || !second_part.valid
+        return Missing
+    hour = hour_part.value
+    minute = minute_part.value
+    second = second_part.value
+    if hour > 23 || minute > 59 || second > 60
+        return Missing
+
+    fraction = 0
+    fraction_len = 0
+    if dot >= 0
+        fraction_len = z_pos - dot - 1
+        if fraction_len > 9
+            return Missing
+        if fraction_len > 0
+            fraction_part = parse_digits(text, dot + 1, z_pos)
+            if !fraction_part.valid
+                return Missing
+            fraction = fraction_part.value
+            i = fraction_len
+            while i < 9
+                fraction = fraction * 10
+                i = i + 1
+    fraction_units = fraction / (1000000000 / scale)
+    days = unix_days_from_civil(year, month, day)
+    seconds = days * 86400 + hour * 3600 + minute * 60 + second
+    min_i64 = -9223372036854775807 - 1
+    max_i64 = 9223372036854775807
+    if seconds < min_i64 / scale || seconds > (max_i64 - fraction_units) / scale
+        return Missing
+    Present(seconds * scale + fraction_units)
+
+fn parse_timestamp_micros(text: &String) -> OptionalInt ! alloc
+    parse_utc_scaled(text, 1000000)
+
+fn parse_date_millis(text: &String) -> OptionalInt ! alloc
+    parse_utc_scaled(text, 1000)
+
+fn error_new(message: String) -> Error
+    Error(message, false, 0)
+
+fn error_at(message: String, position: Int) -> Error
+    Error(message, true, position)
+
+fn scalar_is_null(value: &Scalar) -> Bool
+    match value
+        Null => true
+        _ => false
+
+fn f32_bits_is_nan(bits: Int) -> Bool
+    exponent = (bits >> 23) & 255
+    fraction = bits & 8388607
+    exponent == 255 && fraction != 0
+
+fn f64_bits_is_nan(bits: Int) -> Bool
+    exponent = (bits >> 52) & 2047
+    fraction = bits & 4503599627370495
+    exponent == 2047 && fraction != 0
+
+fn power_of_two(exponent: Float) -> Float
+    two = 2.0
+    two.pow(exponent)
+
+fn f32_bits_to_float(bits: Int) -> Float
+    sign = 1.0
+    if (bits & 2147483648) != 0
+        sign = 0.0 - 1.0
+    exponent = (bits >> 23) & 255
+    fraction = bits & 8388607
+    if exponent == 0
+        sign * fraction.to_float() * power_of_two(-149.0)
+    elsif exponent == 255
+        sign * power_of_two(1024.0)
+    else
+        significand = (fraction + 8388608).to_float()
+        sign * significand * power_of_two((exponent - 150).to_float())
+
+fn f64_bits_to_float(bits: Int) -> Float
+    sign = 1.0
+    if bits < 0
+        sign = 0.0 - 1.0
+    exponent = (bits >> 52) & 2047
+    fraction = bits & 4503599627370495
+    if exponent == 0
+        sign * fraction.to_float() * power_of_two(-1074.0)
+    elsif exponent == 2047
+        sign * power_of_two(1024.0)
+    else
+        significand = (fraction + 4503599627370496).to_float()
+        sign * significand * power_of_two((exponent - 1075).to_float())
+
+fn type_tag(column_type: Int) -> Int
+    if column_type < 0
+        -1
+    else
+        column_type & 255
+
+fn type_name(tag: Int) -> String ! alloc
+    match tag
+        1 => d"BOOLEAN"
+        2 => d"BYTE"
+        3 => d"SHORT"
+        4 => d"CHAR"
+        5 => d"INT"
+        6 => d"LONG"
+        7 => d"DATE"
+        8 => d"TIMESTAMP"
+        9 => d"FLOAT"
+        10 => d"DOUBLE"
+        11 => d"STRING"
+        12 => d"SYMBOL"
+        25 => d"IPv4"
+        26 => d"VARCHAR"
+        _ => d"UNSUPPORTED"

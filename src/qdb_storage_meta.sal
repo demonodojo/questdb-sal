@@ -1,0 +1,179 @@
+import "qdb_types.sal"
+
+# QuestDB 10.1.0 `_meta` header and column records. Offsets mirror
+# qdb-storage/src/meta.rs; all integer fields in the file are little-endian.
+META_OFFSET_COUNT = 0
+META_OFFSET_PARTITION_BY = 4
+META_OFFSET_TIMESTAMP_INDEX = 8
+META_OFFSET_VERSION = 12
+META_OFFSET_TABLE_ID = 16
+META_OFFSET_WAL_ENABLED = 40
+META_OFFSET_COLUMN_TYPES = 128
+META_COLUMN_DATA_SIZE = 32
+META_COLUMN_REPLACING_INDEX = 24
+
+struct ColumnMeta
+    name: String
+    raw_type: Int
+    tag: Int
+    symbol_index: Int
+    has_symbol_index: Bool
+
+struct TableMeta
+    column_count: Int
+    partition_by: Int
+    timestamp_index: Int
+    version: Int
+    table_id: Int
+    wal_enabled: Bool
+    columns: List[ColumnMeta]
+
+struct ReadInt
+    value: Int
+    valid: Bool
+
+struct ReadText
+    value: String
+    used: Int
+    code: Int
+
+enum MetaResult
+    MetaOk(TableMeta)
+    MetaErr(Error)
+
+fn read_i32(bytes: &Bytes, offset: Int) -> ReadInt
+    if offset < 0 || offset > bytes.len() - 4
+        ReadInt(0, false)
+    else
+        raw = bytes.get_u32(offset)
+        if raw >= 2147483648
+            raw = raw - 4294967296
+        ReadInt(raw, true)
+
+# Read the QuestDB putStr representation: signed i32 UTF-16 length followed
+# by little-endian UTF-16 code units; -1 means SQL NULL.
+fn read_utf16(bytes: &Bytes, offset: Int) -> ReadText ! alloc
+    length_field = read_i32(bytes, offset)
+    if !length_field.valid
+        ReadText(d"", 0, -1)
+    elsif length_field.value == NULL_STRING_LEN
+        ReadText(d"", 4, -5)
+    elsif length_field.value < 0
+        ReadText(d"", 0, -2)
+    elsif offset > bytes.len() - 4 || length_field.value > (bytes.len() - offset - 4) / 2
+        ReadText(d"", 0, -3)
+    else
+        text = d""
+        index = 0
+        valid = true
+        while index < length_field.value && valid
+            unit = bytes.get_u16(offset + 4 + index * 2)
+            if unit >= 55296 && unit <= 56319
+                if index + 1 >= length_field.value
+                    valid = false
+                else
+                    low = bytes.get_u16(offset + 4 + (index + 1) * 2)
+                    if low < 56320 || low > 57343
+                        valid = false
+                    else
+                        codepoint = 65536 + (unit - 55296) * 1024 + (low - 56320)
+                        text = text + String.from_char(codepoint)
+                        index = index + 2
+            elsif unit >= 56320 && unit <= 57343
+                valid = false
+            else
+                text = text + String.from_char(unit)
+                index = index + 1
+        if !valid
+            ReadText(d"", 0, -4)
+        else
+            ReadText(text, 4 + length_field.value * 2, 0)
+
+fn meta_error(message: String) -> MetaResult
+    MetaErr(error_new(message))
+
+fn supported_column_tag(tag: Int) -> Bool
+    tag == TAG_BOOLEAN || tag == TAG_BYTE || tag == TAG_SHORT || tag == TAG_CHAR || tag == TAG_INT || tag == TAG_LONG || tag == TAG_DATE || tag == TAG_TIMESTAMP || tag == TAG_FLOAT || tag == TAG_DOUBLE || tag == TAG_STRING || tag == TAG_SYMBOL || tag == TAG_VARCHAR
+
+fn parse_meta(bytes: &Bytes) -> MetaResult ! alloc
+    count_field = read_i32(bytes, META_OFFSET_COUNT)
+    if !count_field.valid
+        return meta_error(d"_meta: truncated column count")
+    count = count_field.value
+    if count <= 0
+        return meta_error(d"_meta: column count is not positive")
+    if bytes.len() < META_OFFSET_COLUMN_TYPES || count > (bytes.len() - META_OFFSET_COLUMN_TYPES) / META_COLUMN_DATA_SIZE
+        return meta_error(d"_meta: column records extend past the file")
+
+    partition_field = read_i32(bytes, META_OFFSET_PARTITION_BY)
+    timestamp_field = read_i32(bytes, META_OFFSET_TIMESTAMP_INDEX)
+    version_field = read_i32(bytes, META_OFFSET_VERSION)
+    table_id_field = read_i32(bytes, META_OFFSET_TABLE_ID)
+    if !partition_field.valid || !timestamp_field.valid || !version_field.valid || !table_id_field.valid || bytes.len() <= META_OFFSET_WAL_ENABLED
+        return meta_error(d"_meta: file is shorter than the header")
+    partition_by = partition_field.value
+    if partition_by != PARTITION_BY_NONE && partition_by != PARTITION_BY_DAY
+        return meta_error(d"unsupported partition by " + partition_by.to_str())
+    version = version_field.value
+    if version != METADATA_VERSION_10_1_0
+        return meta_error(d"unsupported _meta version " + version.to_str())
+    wal_enabled = false
+    if bytes.get_u8(META_OFFSET_WAL_ENABLED) != 0
+        wal_enabled = true
+    if wal_enabled
+        return meta_error(d"WAL tables are not supported by this reader")
+
+    columns = List.new[ColumnMeta]()
+    symbol_count = 0
+    index = 0
+    while index < count
+        record_offset = META_OFFSET_COLUMN_TYPES + index * META_COLUMN_DATA_SIZE
+        raw_field = read_i32(bytes, record_offset)
+        replacing_field = read_i32(bytes, record_offset + META_COLUMN_REPLACING_INDEX)
+        if !raw_field.valid || !replacing_field.valid
+            return meta_error(d"_meta: truncated column record")
+        raw_type = raw_field.value
+        if raw_type < 0
+            return meta_error(d"unsupported deleted column at index " + index.to_str())
+        if replacing_field.value != 0
+            return meta_error(d"unsupported column replacement at index " + index.to_str())
+        tag = type_tag(raw_type)
+        if tag == TAG_TIMESTAMP && (raw_type & TIMESTAMP_NANO_FLAG) != 0
+            return meta_error(d"nanosecond timestamps are not supported by this reader")
+        if !supported_column_tag(tag)
+            return meta_error(d"unsupported column type " + type_name(tag) + d" (tag " + tag.to_str() + d") at index " + index.to_str())
+        has_symbol = false
+        symbol_index = -1
+        if tag == TAG_SYMBOL
+            has_symbol = true
+            symbol_index = symbol_count
+            symbol_count = symbol_count + 1
+        columns.push(ColumnMeta(d"", raw_type, tag, symbol_index, has_symbol))
+        index = index + 1
+
+    timestamp_index = timestamp_field.value
+    if timestamp_index < -1 || timestamp_index >= count
+        return meta_error(d"_meta: timestamp index is outside the column range")
+
+    cursor = META_OFFSET_COLUMN_TYPES + count * META_COLUMN_DATA_SIZE
+    index = 0
+    while index < count
+        previous = columns.get(index)
+        name = read_utf16(bytes, cursor)
+        if name.code == -5
+            return meta_error(d"_meta: NULL column name at " + index.to_str())
+        if name.code == -1
+            return meta_error(d"_meta: truncated column name")
+        if name.code == -2
+            return meta_error(d"_meta: invalid negative column name length")
+        if name.code == -3
+            return meta_error(d"_meta: column name extends past the file")
+        if name.code == -4
+            return meta_error(d"_meta: invalid UTF-16 column name")
+        if name.value.len() == 0 || name.value.len() > 255
+            return meta_error(d"_meta: column name length is invalid at " + index.to_str())
+        columns.set(index, ColumnMeta(name.value, previous.raw_type, previous.tag, previous.symbol_index, previous.has_symbol_index))
+        cursor = cursor + name.used
+        index = index + 1
+
+    MetaOk(TableMeta(count, partition_by, timestamp_index, version, table_id_field.value, wal_enabled, columns))

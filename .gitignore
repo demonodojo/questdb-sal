@@ -1,0 +1,16 @@
+# Artefactos de compilación de SAL
+/target/
+/sal_modules/
+/reference/
+
+# Binarios y salida generada localmente
+*.log
+*.tmp
+*.profraw
+
+# Editores y sistema operativo
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

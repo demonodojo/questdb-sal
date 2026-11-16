@@ -1,0 +1,26 @@
+import "../src/qdb_types.sal"
+import "../src/qdb_storage_io.sal"
+import "../src/qdb_storage_txn.sal"
+import "support/assert.sal"
+
+fn main() -> Int ! io, alloc
+    match read_file_bytes(&d"tests/fixtures/h1/db/sensors/_txn", 4096)
+        FileBytesErr(_) => 1
+        FileBytesOk(bytes) =>
+            match parse_txn(&bytes)
+                TxnErr(_) => 2
+                TxnOk(txn) =>
+                    if txn.txn != 4
+                        3
+                    elsif txn.transient_row_count != 4
+                        4
+                    elsif txn.fixed_row_count != 0
+                        5
+                    elsif txn_row_count(&txn) != 4
+                        6
+                    elsif txn.symbol_counts.len() != 1
+                        7
+                    elsif txn.partitions.len() != 0
+                        8
+                    else
+                        assert_zero(txn.max_timestamp - 1577934248000000, 9)

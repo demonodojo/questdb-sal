@@ -1,0 +1,45 @@
+import "../src/qdb_types.sal"
+import "../src/qdb_storage_io.sal"
+import "../src/qdb_storage_meta.sal"
+import "support/assert.sal"
+
+fn truncated_meta_is_rejected() -> Int ! alloc
+    bytes = Bytes.new(3)
+    match parse_meta(&bytes)
+        MetaErr(_) => 0
+        MetaOk(_) => 1
+
+fn main() -> Int ! io, alloc
+    truncation_check = truncated_meta_is_rejected()
+    if truncation_check != 0
+        truncation_check
+    else
+        match read_file_bytes(&d"tests/fixtures/h1/db/sensors/_meta", 4096)
+            FileBytesErr(_) => 1
+            FileBytesOk(bytes) =>
+                match parse_meta(&bytes)
+                    MetaErr(_) => 2
+                    MetaOk(meta) =>
+                        if meta.column_count != 13
+                            3
+                        elsif meta.partition_by != PARTITION_BY_NONE
+                            4
+                        elsif meta.timestamp_index != 0
+                            5
+                        elsif meta.version != METADATA_VERSION_10_1_0
+                            6
+                        else
+                            first = meta.columns.get(0)
+                            name_check = assert_str_eq(&first.name, &d"ts", 7)
+                            if name_check != 0
+                                name_check
+                            elsif first.tag != TAG_TIMESTAMP
+                                8
+                            else
+                                symbols = meta.columns.get(10)
+                                if !symbols.has_symbol_index
+                                    9
+                                elsif symbols.symbol_index != 0
+                                    10
+                                else
+                                    assert_zero(meta.columns.get(12).tag - TAG_VARCHAR, 11)

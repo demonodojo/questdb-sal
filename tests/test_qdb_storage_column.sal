@@ -1,0 +1,82 @@
+import "../src/qdb_types.sal"
+import "../src/qdb_storage_io.sal"
+import "../src/qdb_storage_meta.sal"
+import "../src/qdb_storage_column.sal"
+import "support/assert.sal"
+
+fn fixture_bytes(path: &String) -> Bytes ! io, alloc
+    match read_file_bytes(path, 4096)
+        FileBytesOk(bytes) => bytes
+        FileBytesErr(_) => Bytes.new(0)
+
+fn read_fixture_column(meta: &TableMeta, index: Int, data_path: &String, aux_path: &String, symbols: &List[String], has_symbols: Bool) -> ColumnResult ! io, alloc
+    data = fixture_bytes(data_path)
+    aux = Bytes.new(0)
+    if aux_path.len() > 0
+        aux = fixture_bytes(aux_path)
+    read_column(meta.columns.get(index), 4, &data, &aux, symbols, has_symbols)
+
+fn check_text_column(meta: &TableMeta, index: Int, data_path: &String, aux_path: &String, expected: &String, code: Int) -> Int ! io, alloc
+    symbols = List.new[String]()
+    match read_fixture_column(meta, index, data_path, aux_path, &symbols, false)
+        ColumnError(_) => code
+        ColumnValues(values) =>
+            match values.get(0)
+                Text(value) => assert_str_eq(&value, expected, code)
+                _ => code
+
+fn check_null_column_value(meta: &TableMeta, index: Int, data_path: &String, aux_path: &String, row: Int, code: Int) -> Int ! io, alloc
+    symbols = List.new[String]()
+    match read_fixture_column(meta, index, data_path, aux_path, &symbols, false)
+        ColumnError(_) => code
+        ColumnValues(values) =>
+            if scalar_is_null(values.get(row))
+                0
+            else
+                code
+
+fn check_symbol_column(meta: &TableMeta) -> Int ! io, alloc
+    chars = fixture_bytes(&d"tests/fixtures/h1/db/sensors/location.c")
+    offsets = fixture_bytes(&d"tests/fixtures/h1/db/sensors/location.o")
+    match read_symbol_map(&chars, &offsets, 2, &d"location")
+        SymbolError(_) => 20
+        SymbolValues(symbols) =>
+            data = fixture_bytes(&d"tests/fixtures/h1/db/sensors/default/location.d")
+            aux = Bytes.new(0)
+            match read_column(meta.columns.get(10), 4, &data, &aux, &symbols, true)
+                ColumnError(_) => 21
+                ColumnValues(values) =>
+                    match values.get(0)
+                        Text(value) => assert_str_eq(&value, &d"madrid", 22)
+                        _ => 23
+
+fn main() -> Int ! io, alloc
+    meta_bytes = fixture_bytes(&d"tests/fixtures/h1/db/sensors/_meta")
+    match parse_meta(&meta_bytes)
+        MetaErr(_) => 1
+        MetaOk(meta) =>
+            flags = fixture_bytes(&d"tests/fixtures/h1/db/sensors/default/flags.d")
+            empty = Bytes.new(0)
+            symbols = List.new[String]()
+            match read_column(meta.columns.get(2), 4, &flags, &empty, &symbols, false)
+                ColumnError(_) => 2
+                ColumnValues(flag_values) =>
+                    numeric_check = match flag_values.get(0)
+                        IntValue(value) => assert_zero(value - 10, 3)
+                        _ => 4
+                    if numeric_check != 0
+                        numeric_check
+                    else
+                        note_check = check_text_column(&meta, 9, &d"tests/fixtures/h1/db/sensors/default/note.d", &d"tests/fixtures/h1/db/sensors/default/note.i", &d"alpha", 5)
+                        if note_check != 0
+                            note_check
+                        else
+                            null_check = check_null_column_value(&meta, 9, &d"tests/fixtures/h1/db/sensors/default/note.d", &d"tests/fixtures/h1/db/sensors/default/note.i", 1, 6)
+                            if null_check != 0
+                                null_check
+                            else
+                                tag_check = check_text_column(&meta, 11, &d"tests/fixtures/h1/db/sensors/default/tag.d", &d"tests/fixtures/h1/db/sensors/default/tag.i", &d"v1", 7)
+                                if tag_check != 0
+                                    tag_check
+                                else
+                                    check_symbol_column(&meta)

@@ -1,0 +1,11 @@
+fn assert_zero(got: Int, code: Int) -> Int
+    if got == 0
+        0
+    else
+        code
+
+fn assert_str_eq(got: &String, want: &String, code: Int) -> Int ! alloc
+    if got.eq(want) != 0
+        0
+    else
+        code
